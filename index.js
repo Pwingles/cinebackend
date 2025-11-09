@@ -16,6 +16,8 @@ import { ErrorObject } from './src/helpers/ErrorObject.js';
 import { getCacheStats } from './src/cache/cache.js';
 import { startup } from './src/utils/startup.js';
 import { fileURLToPath } from 'url';
+import { throttleMiddleware } from './src/middleware/throttle.js';
+import { metrics } from './src/utils/metrics.js';
 
 const PORT = process.env.PORT;
 const allowedOrigins = process.env.ALLOWED_ORIGINS; // localhost is also allowed. (from any localhost port)
@@ -23,6 +25,9 @@ const app = express();
 
 // Trust proxy to get correct protocol and IP from Railway
 app.set('trust proxy', true);
+
+// Parse JSON bodies for POST requests
+app.use(express.json());
 
 app.use(
     cors({
@@ -35,6 +40,9 @@ app.use(
         }
     })
 );
+
+// Apply throttling middleware to all routes
+app.use(throttleMiddleware);
 
 createProxyRoutes(app);
 
@@ -151,6 +159,11 @@ app.get('/tv/', (req, res) => {
     );
 });
 
+// Health check endpoint
+app.get('/healthz', (req, res) => {
+    res.status(200).json({ status: 'OK' });
+});
+
 // Endpoint to flex how well our cache is doing - because who doesn't love stats
 // Hell Yeah we love it, Because STONE COLD SAID SOOOOO
 app.get('/cache-stats', (req, res) => {
@@ -159,6 +172,16 @@ app.get('/cache-stats', (req, res) => {
         ...stats,
         cacheEnabled: true,
         ttl: '3 hours (10800 seconds)'
+    });
+});
+
+// Metrics endpoint
+app.get('/metrics', (req, res) => {
+    const globalMetrics = metrics.getGlobalMetrics();
+    const hostMetrics = metrics.getAllHostMetrics();
+    res.status(200).json({
+        global: globalMetrics,
+        hosts: hostMetrics
     });
 });
 

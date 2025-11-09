@@ -3,6 +3,11 @@ import { extractOriginalUrl, getOriginFromUrl } from './parser.js';
 import { handleCors, setCorsHeaders } from './handleCors.js';
 import { proxyM3U8 } from './m3u8proxy.js';
 import { proxyTs } from './proxyTs.js';
+import { normalizeUrl, validateUrlSafety, sanitizeUrlForLogging } from '../utils/urlNormalizer.js';
+import { extractHostname, isHostAllowed, getHeadersForHost } from '../utils/hostConfig.js';
+import { logRequest } from '../utils/metrics.js';
+import { resolveUrl } from '../utils/resolver.js';
+import { ErrorObject } from '../helpers/ErrorObject.js';
 
 // Helper function to validate and fix Referer header
 // Ensures Referer is always a full URL, not just a video ID
@@ -107,222 +112,326 @@ export function createProxyRoutes(app) {
         );
     });
 
-    // Simplified M3U8 Proxy endpoint based on working implementation
-    app.get('/m3u8-proxy', async (req, res) => {
+    // Helper function to handle m3u8 proxy requests (used by both GET and POST)
+    async function handleM3U8Proxy(req, res, targetUrl, headers) {
         if (handleCors(req, res)) return;
 
-        const targetUrl = req.query.url;
-        let headers = {};
-
-        // Log request for debugging
-        console.log('[M3U8-Proxy] Request received:', {
-            url: targetUrl ? targetUrl.substring(0, 100) + '...' : 'missing',
-            hasHeaders: !!req.query.headers,
-            timestamp: new Date().toISOString()
-        });
-
-        try {
-            headers = JSON.parse(req.query.headers || '{}');
-        } catch (e) {
-            console.warn('[M3U8-Proxy] Invalid headers JSON:', e.message);
-            // Continue with empty headers
-        }
+        const startTime = Date.now();
 
         // Validate URL parameter
         if (!targetUrl) {
             setCorsHeaders(res);
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ 
-                error: 'URL parameter required',
-                message: 'The url query parameter is missing'
-            }));
+            res.status(400).json(new ErrorObject(
+                'URL_MALFORMED: URL parameter required',
+                'proxy',
+                400,
+                'The url parameter is missing',
+                true
+            ).toJSON());
             return;
         }
 
-        // Normalize URL encoding (Express automatically decodes query params, so this should be clean)
-        // But ensure we're working with a properly formatted URL
-        let normalizedUrl = targetUrl;
+        let normalizedUrl;
+        let hostname;
+
         try {
-            // If URL is already a valid URL object, reconstruct it to ensure proper encoding
-            const urlObj = new URL(targetUrl);
-            normalizedUrl = urlObj.href; // This ensures proper encoding
-        } catch (e) {
-            // Not a valid URL, validation will catch it below
-        }
-
-        // Validate URL format
-        if (!isValidUrl(normalizedUrl)) {
-            console.error('[M3U8-Proxy] Invalid URL format:', normalizedUrl.substring(0, 100));
-            setCorsHeaders(res);
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ 
-                error: 'Invalid URL format',
-                message: 'The provided URL is not a valid HTTP/HTTPS URL'
-            }));
-            return;
-        }
-
-        // Validate and fix Referer header if present
-        if (headers.Referer && headers.Origin) {
-            const validReferer = validateRefererHeader(headers.Referer, headers.Origin);
-            if (validReferer && validReferer !== headers.Referer) {
-                console.log('[M3U8-Proxy] Fixed invalid Referer:', {
-                    original: headers.Referer,
-                    fixed: validReferer
-                });
-                headers.Referer = validReferer;
+            // Validate URL safety first
+            const safety = validateUrlSafety(targetUrl);
+            if (!safety.valid) {
+                setCorsHeaders(res);
+                res.status(400).json(new ErrorObject(
+                    safety.reason,
+                    'proxy',
+                    400,
+                    safety.reason,
+                    true
+                ).toJSON());
+                return;
             }
+
+            // Normalize URL
+            normalizedUrl = normalizeUrl(targetUrl);
+            hostname = extractHostname(normalizedUrl);
+
+            // Check host allowlist
+            if (!isHostAllowed(hostname)) {
+                const sanitized = sanitizeUrlForLogging(normalizedUrl);
+                logRequest(hostname, 'manifest', false, Date.now() - startTime, 403, sanitized);
+                setCorsHeaders(res);
+                res.status(403).json(new ErrorObject(
+                    `HOST_NOT_ALLOWED: Host ${hostname} is not in allowlist`,
+                    'proxy',
+                    403,
+                    `Host ${hostname} is not allowed`,
+                    true
+                ).toJSON());
+                return;
+            }
+
+            // Get headers for host
+            headers = getHeadersForHost(hostname, headers || {});
+
+            // Validate and fix Referer header if present
+            if (headers.Referer && headers.Origin) {
+                const validReferer = validateRefererHeader(headers.Referer, headers.Origin);
+                if (validReferer && validReferer !== headers.Referer) {
+                    headers.Referer = validReferer;
+                }
+            }
+
+        } catch (error) {
+            const sanitized = sanitizeUrlForLogging(targetUrl);
+            logRequest(hostname || 'unknown', 'manifest', false, Date.now() - startTime, 400, sanitized);
+            setCorsHeaders(res);
+            res.status(400).json(new ErrorObject(
+                error.message || 'URL_MALFORMED: Invalid URL',
+                'proxy',
+                400,
+                error.message || 'Invalid URL format',
+                true
+            ).toJSON());
+            return;
         }
 
         // Get server URL for building proxy URLs with proper HTTPS detection
         const serverUrl = getServerUrl(req);
-
-        // Add timeout wrapper
-        const timeout = 60000; // 60 seconds timeout
-        const timeoutId = setTimeout(() => {
-            if (!res.headersSent) {
-                console.error('[M3U8-Proxy] Request timeout after', timeout, 'ms');
-                setCorsHeaders(res);
-                res.writeHead(504, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ 
-                    error: 'Gateway Timeout',
-                    message: 'The upstream server did not respond in time'
-                }));
-            }
-        }, timeout);
+        const sanitized = sanitizeUrlForLogging(normalizedUrl);
 
         try {
             await proxyM3U8(normalizedUrl, headers, res, serverUrl);
+            const duration = Date.now() - startTime;
+            logRequest(hostname, 'manifest', true, duration, 200, sanitized);
         } catch (error) {
-            clearTimeout(timeoutId);
-            console.error('[M3U8-Proxy] Error:', {
-                message: error.message,
-                stack: error.stack,
-                url: normalizedUrl ? normalizedUrl.substring(0, 100) : 'unknown'
-            });
-            
+            const duration = Date.now() - startTime;
+            let statusCode = 500;
+            let errorCode = 'ERROR';
+
+            if (error.message.includes('timeout')) {
+                statusCode = 504;
+                errorCode = 'TIMEOUT';
+            } else if (error.message.includes('ECONNREFUSED') || error.message.includes('ENOTFOUND')) {
+                statusCode = 502;
+                errorCode = 'BAD_GATEWAY';
+            } else if (error.message.includes('403') || error.message.includes('UPSTREAM_403')) {
+                statusCode = 403;
+                errorCode = 'UPSTREAM_403';
+            }
+
+            logRequest(hostname, 'manifest', false, duration, statusCode, sanitized);
+
             if (!res.headersSent) {
                 setCorsHeaders(res);
-                // Determine appropriate status code
-                let statusCode = 500;
-                let errorMessage = error.message || 'Unknown error occurred';
-                
-                if (error.message.includes('timeout')) {
-                    statusCode = 504;
-                    errorMessage = 'Gateway Timeout - upstream server did not respond';
-                } else if (error.message.includes('ECONNREFUSED') || error.message.includes('ENOTFOUND')) {
-                    statusCode = 502;
-                    errorMessage = 'Bad Gateway - could not connect to upstream server';
-                }
-                
-                res.writeHead(statusCode, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ 
-                    error: statusCode === 504 ? 'Gateway Timeout' : statusCode === 502 ? 'Bad Gateway' : 'Internal Server Error',
-                    message: errorMessage
-                }));
+                res.status(statusCode).json(new ErrorObject(
+                    `${errorCode}: ${error.message || 'Unknown error occurred'}`,
+                    'proxy',
+                    statusCode,
+                    error.message || 'Unknown error',
+                    true
+                ).toJSON());
             }
-        } finally {
-            clearTimeout(timeoutId);
         }
-    });
+    }
 
-    // Simplified TS/Segment Proxy endpoint
-    app.get('/ts-proxy', async (req, res) => {
-        if (handleCors(req, res)) return;
-
+    // GET /m3u8-proxy (legacy support)
+    app.get('/m3u8-proxy', async (req, res) => {
         const targetUrl = req.query.url;
         let headers = {};
 
         try {
             headers = JSON.parse(req.query.headers || '{}');
         } catch (e) {
-            console.warn('[TS-Proxy] Invalid headers JSON:', e.message);
+            // Continue with empty headers
+        }
+
+        await handleM3U8Proxy(req, res, targetUrl, headers);
+    });
+
+    // POST /m3u8-proxy (new endpoint)
+    app.post('/m3u8-proxy', async (req, res) => {
+        const { url, headers } = req.body || {};
+        await handleM3U8Proxy(req, res, url, headers);
+    });
+
+    // POST /resolve - normalize messy provider responses to single valid m3u8 URL
+    app.post('/resolve', async (req, res) => {
+        if (handleCors(req, res)) return;
+
+        const startTime = Date.now();
+        const { url, headers } = req.body || {};
+
+        if (!url) {
+            setCorsHeaders(res);
+            res.status(400).json(new ErrorObject(
+                'URL_MALFORMED: URL parameter required',
+                'resolver',
+                400,
+                'The url parameter is missing in request body',
+                true
+            ).toJSON());
+            return;
+        }
+
+        try {
+            const resolvedUrl = await resolveUrl(url, headers || {});
+            const duration = Date.now() - startTime;
+            const hostname = extractHostname(resolvedUrl);
+            const sanitized = sanitizeUrlForLogging(resolvedUrl);
+            
+            logRequest(hostname, 'resolve', true, duration, 200, sanitized);
+            
+            setCorsHeaders(res);
+            res.status(200).json({
+                url: resolvedUrl,
+                resolved: true
+            });
+        } catch (error) {
+            const duration = Date.now() - startTime;
+            let statusCode = 400;
+            let errorCode = 'URL_MALFORMED';
+
+            if (error.message.includes('HOST_NOT_ALLOWED')) {
+                statusCode = 403;
+                errorCode = 'HOST_NOT_ALLOWED';
+            } else if (error.message.includes('timeout')) {
+                statusCode = 504;
+                errorCode = 'TIMEOUT';
+            }
+
+            logRequest('unknown', 'resolve', false, duration, statusCode);
+
+            setCorsHeaders(res);
+            res.status(statusCode).json(new ErrorObject(
+                error.message || `${errorCode}: Failed to resolve URL`,
+                'resolver',
+                statusCode,
+                error.message || 'Failed to resolve URL',
+                true
+            ).toJSON());
+        }
+    });
+
+    // TS/Segment Proxy endpoint
+    app.get('/ts-proxy', async (req, res) => {
+        if (handleCors(req, res)) return;
+
+        const startTime = Date.now();
+        const targetUrl = req.query.url;
+        let headers = {};
+
+        try {
+            headers = JSON.parse(req.query.headers || '{}');
+        } catch (e) {
+            // Continue with empty headers
         }
 
         if (!targetUrl) {
             setCorsHeaders(res);
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ 
-                error: 'URL parameter required',
-                message: 'The url query parameter is missing'
-            }));
+            res.status(400).json(new ErrorObject(
+                'URL_MALFORMED: URL parameter required',
+                'proxy',
+                400,
+                'The url query parameter is missing',
+                true
+            ).toJSON());
             return;
         }
 
-        // Normalize URL encoding (Express automatically decodes query params)
-        let normalizedUrl = targetUrl;
+        let normalizedUrl;
+        let hostname;
+
         try {
-            const urlObj = new URL(targetUrl);
-            normalizedUrl = urlObj.href; // Ensures proper encoding
-        } catch (e) {
-            // Not a valid URL, validation will catch it below
-        }
+            // Validate URL safety
+            const safety = validateUrlSafety(targetUrl);
+            if (!safety.valid) {
+                setCorsHeaders(res);
+                res.status(400).json(new ErrorObject(
+                    safety.reason,
+                    'proxy',
+                    400,
+                    safety.reason,
+                    true
+                ).toJSON());
+                return;
+            }
 
-        // Validate URL format
-        if (!isValidUrl(normalizedUrl)) {
-            console.error('[TS-Proxy] Invalid URL format:', normalizedUrl.substring(0, 100));
+            // Normalize URL
+            normalizedUrl = normalizeUrl(targetUrl);
+            hostname = extractHostname(normalizedUrl);
+
+            // Check host allowlist
+            if (!isHostAllowed(hostname)) {
+                const sanitized = sanitizeUrlForLogging(normalizedUrl);
+                logRequest(hostname, 'segment', false, Date.now() - startTime, 403, sanitized);
+                setCorsHeaders(res);
+                res.status(403).json(new ErrorObject(
+                    `HOST_NOT_ALLOWED: Host ${hostname} is not in allowlist`,
+                    'proxy',
+                    403,
+                    `Host ${hostname} is not allowed`,
+                    true
+                ).toJSON());
+                return;
+            }
+
+            // Get headers for host
+            headers = getHeadersForHost(hostname, headers);
+
+            // Validate and fix Referer header if present
+            if (headers.Referer && headers.Origin) {
+                const validReferer = validateRefererHeader(headers.Referer, headers.Origin);
+                if (validReferer && validReferer !== headers.Referer) {
+                    headers.Referer = validReferer;
+                }
+            }
+
+        } catch (error) {
+            const sanitized = sanitizeUrlForLogging(targetUrl);
+            logRequest(hostname || 'unknown', 'segment', false, Date.now() - startTime, 400, sanitized);
             setCorsHeaders(res);
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ 
-                error: 'Invalid URL format',
-                message: 'The provided URL is not a valid HTTP/HTTPS URL'
-            }));
+            res.status(400).json(new ErrorObject(
+                error.message || 'URL_MALFORMED: Invalid URL',
+                'proxy',
+                400,
+                error.message || 'Invalid URL format',
+                true
+            ).toJSON());
             return;
         }
 
-        // Validate and fix Referer header if present
-        if (headers.Referer && headers.Origin) {
-            const validReferer = validateRefererHeader(headers.Referer, headers.Origin);
-            if (validReferer && validReferer !== headers.Referer) {
-                headers.Referer = validReferer;
-            }
-        }
-
-        // Add timeout wrapper
-        const timeout = 60000; // 60 seconds timeout
-        const timeoutId = setTimeout(() => {
-            if (!res.headersSent) {
-                console.error('[TS-Proxy] Request timeout after', timeout, 'ms');
-                setCorsHeaders(res);
-                res.writeHead(504, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ 
-                    error: 'Gateway Timeout',
-                    message: 'The upstream server did not respond in time'
-                }));
-            }
-        }, timeout);
+        const sanitized = sanitizeUrlForLogging(normalizedUrl);
 
         try {
             await proxyTs(normalizedUrl, headers, req, res);
+            const duration = Date.now() - startTime;
+            logRequest(hostname, 'segment', true, duration, 200, sanitized);
         } catch (error) {
-            clearTimeout(timeoutId);
-            console.error('[TS-Proxy] Error:', {
-                message: error.message,
-                url: normalizedUrl ? normalizedUrl.substring(0, 100) : 'unknown'
-            });
-            
+            const duration = Date.now() - startTime;
+            let statusCode = 500;
+            let errorCode = 'ERROR';
+
+            if (error.message.includes('timeout')) {
+                statusCode = 504;
+                errorCode = 'TIMEOUT';
+            } else if (error.message.includes('ECONNREFUSED') || error.message.includes('ENOTFOUND')) {
+                statusCode = 502;
+                errorCode = 'BAD_GATEWAY';
+            } else if (error.message.includes('403') || error.message.includes('UPSTREAM_403')) {
+                statusCode = 403;
+                errorCode = 'UPSTREAM_403';
+            }
+
+            logRequest(hostname, 'segment', false, duration, statusCode, sanitized);
+
             if (!res.headersSent) {
                 setCorsHeaders(res);
-                // Determine appropriate status code
-                let statusCode = 500;
-                let errorMessage = error.message || 'Unknown error occurred';
-                
-                if (error.message.includes('timeout')) {
-                    statusCode = 504;
-                    errorMessage = 'Gateway Timeout - upstream server did not respond';
-                } else if (error.message.includes('ECONNREFUSED') || error.message.includes('ENOTFOUND')) {
-                    statusCode = 502;
-                    errorMessage = 'Bad Gateway - could not connect to upstream server';
-                }
-                
-                res.writeHead(statusCode, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ 
-                    error: statusCode === 504 ? 'Gateway Timeout' : statusCode === 502 ? 'Bad Gateway' : 'Internal Server Error',
-                    message: errorMessage
-                }));
+                res.status(statusCode).json(new ErrorObject(
+                    `${errorCode}: ${error.message || 'Unknown error occurred'}`,
+                    'proxy',
+                    statusCode,
+                    error.message || 'Unknown error',
+                    true
+                ).toJSON());
             }
-        } finally {
-            clearTimeout(timeoutId);
         }
     });
 

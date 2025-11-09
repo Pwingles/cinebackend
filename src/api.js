@@ -14,6 +14,7 @@ import { getCacheKey, getFromCache, setToCache } from './cache/cache.js';
 import { get111Movies } from './controllers/providers/111movies/111movies.js';
 import { getCinemaOS } from './controllers/providers/CinemaOS/CinemaOS.js';
 import { getMultiembed } from './controllers/providers/MultiEmbed/MultiEmbed.js';
+import { isProviderEnabled } from './utils/providerConfig.js';
 
 const shouldDebug = process.argv.includes('--debug');
 
@@ -43,36 +44,36 @@ export async function scrapeMedia(media) {
     }
     const providers = [
         // WORKING
-        { getTwoEmbed: () => getTwoEmbed(media) },
-        { getAutoembed: () => getAutoembed(media) },
-        { get111Movies: () => get111Movies(media) },
-        { getVidSrcCC: () => getVidSrcCC(media) },
-        { getVidSrc: () => getVidSrc(media) },
-        { getVidrock: () => getVidRock(media) },
-        { getCinemaOS: () => getCinemaOS(media) },
-        { getMultiembed: () => getMultiembed(media) },
-        { getVidsrcWtf: () => getVidsrcWtf(media) },
+        { name: 'getTwoEmbed', fn: () => getTwoEmbed(media), enabled: isProviderEnabled('getTwoEmbed') },
+        { name: 'getAutoembed', fn: () => getAutoembed(media), enabled: isProviderEnabled('getAutoembed') },
+        { name: 'get111Movies', fn: () => get111Movies(media), enabled: isProviderEnabled('get111Movies') },
+        { name: 'getVidSrcCC', fn: () => getVidSrcCC(media), enabled: isProviderEnabled('getVidSrcCC') },
+        { name: 'getVidSrc', fn: () => getVidSrc(media), enabled: isProviderEnabled('getVidSrc') },
+        { name: 'getVidrock', fn: () => getVidRock(media), enabled: isProviderEnabled('getVidrock') },
+        { name: 'getCinemaOS', fn: () => getCinemaOS(media), enabled: isProviderEnabled('getCinemaOS') },
+        { name: 'getMultiembed', fn: () => getMultiembed(media), enabled: isProviderEnabled('getMultiembed') },
+        { name: 'getVidsrcWtf', fn: () => getVidsrcWtf(media), enabled: isProviderEnabled('getVidsrcWtf') },
 
         // It does need to fixed but it acts like it is down sometimes throws 520 or 524 so,
         // You got my point right ?
-        { getVidZee: () => getVidZee(media) },
+        { name: 'getVidZee', fn: () => getVidZee(media), enabled: isProviderEnabled('getVidZee') },
 
         // NEED TO FIX
-        // { getXprime: () => getXprime(media) },
-        // { getPrimewire: () => getPrimewire(media) },
+        { name: 'getXprime', fn: () => getXprime(media), enabled: isProviderEnabled('getXprime') },
+        { name: 'getPrimewire', fn: () => getPrimewire(media), enabled: isProviderEnabled('getPrimewire') },
 
         // SUB SEARCH
-        { getWyzie: () => getWyzie(media) },
-        { getLibre: () => getLibre(media) }
-    ];
+        { name: 'getWyzie', fn: () => getWyzie(media), enabled: isProviderEnabled('getWyzie') },
+        { name: 'getLibre', fn: () => getLibre(media), enabled: isProviderEnabled('getLibre') }
+    ].filter(p => p.enabled); // Filter out disabled providers
 
     const results = await Promise.all(
         providers.map(async (provider) => {
-            const providerName = Object.keys(provider)[0];
+            const providerName = provider.name;
 
             try {
                 return {
-                    data: await provider[providerName](),
+                    data: await provider.fn(),
                     provider: providerName
                 };
             } catch (e) {

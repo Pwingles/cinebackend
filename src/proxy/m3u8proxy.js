@@ -2,16 +2,22 @@
 import fetch from 'node-fetch';
 import { DEFAULT_USER_AGENT } from './proxyserver.js';
 import { setCorsHeaders } from './handleCors.js';
+import { getCachedPlaylist, setCachedPlaylist } from '../utils/hlsCache.js';
 
 export async function proxyM3U8(targetUrl, headers, res, serverUrl) {
     try {
-        // Log the request being made
-        console.log('[M3U8-Proxy] Fetching:', {
-            url: targetUrl.substring(0, 150),
-            hasReferer: !!headers.Referer,
-            hasOrigin: !!headers.Origin,
-            referer: headers.Referer ? headers.Referer.substring(0, 50) : 'none'
-        });
+        // Check cache first
+        const cachedContent = getCachedPlaylist(targetUrl);
+        if (cachedContent) {
+            setCorsHeaders(res);
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+            res.setHeader('Content-Length', Buffer.byteLength(cachedContent));
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('X-Cache', 'HIT');
+            res.writeHead(200);
+            res.end(cachedContent);
+            return;
+        }
 
         // Create fetch options with timeout
         const controller = new AbortController();
@@ -30,28 +36,23 @@ export async function proxyM3U8(targetUrl, headers, res, serverUrl) {
 
             if (!response.ok) {
                 // Check for specific error codes
-                let errorMessage = `M3U8 fetch failed: ${response.status}`;
+                let errorMessage = `UPSTREAM_${response.status}: M3U8 fetch failed`;
                 let statusCode = response.status;
 
                 // Handle expired signed URLs (403/401)
                 if (response.status === 403 || response.status === 401) {
-                    errorMessage = 'Access denied - URL may be expired or invalid';
+                    errorMessage = `UPSTREAM_403: Access denied - URL may be expired or invalid`;
                     statusCode = 403;
                 } else if (response.status === 404) {
-                    errorMessage = 'Manifest not found';
+                    errorMessage = 'NOT_FOUND: Manifest not found';
                 }
-
-                console.error('[M3U8-Proxy] Fetch failed:', {
-                    status: response.status,
-                    statusText: response.statusText,
-                    url: targetUrl.substring(0, 100)
-                });
 
                 // Set CORS headers even on error responses
                 setCorsHeaders(res);
                 res.writeHead(statusCode, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ 
-                    error: errorMessage,
+                    code: response.status === 403 ? 'UPSTREAM_403' : response.status === 404 ? 'NOT_FOUND' : 'ERROR',
+                    message: errorMessage,
                     status: response.status,
                     statusText: response.statusText
                 }));
@@ -113,6 +114,9 @@ export async function proxyM3U8(targetUrl, headers, res, serverUrl) {
 
             const processedContent = processedLines.join('\n');
 
+            // Cache the processed content
+            setCachedPlaylist(targetUrl, processedContent);
+
             // Set CORS headers BEFORE setting other headers
             setCorsHeaders(res);
             
@@ -120,6 +124,7 @@ export async function proxyM3U8(targetUrl, headers, res, serverUrl) {
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
             res.setHeader('Content-Length', Buffer.byteLength(processedContent));
             res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('X-Cache', 'MISS');
 
             res.writeHead(200);
             res.end(processedContent);
@@ -153,9 +158,10 @@ export async function proxyM3U8(targetUrl, headers, res, serverUrl) {
         }
         
         if (!res.headersSent) {
+            setCorsHeaders(res);
             res.writeHead(statusCode, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ 
-                error: 'Proxy Error',
+                code: statusCode === 504 ? 'TIMEOUT' : statusCode === 502 ? 'BAD_GATEWAY' : 'ERROR',
                 message: errorMessage
             }));
         }

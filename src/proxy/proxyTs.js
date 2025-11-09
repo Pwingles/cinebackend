@@ -2,9 +2,25 @@
 import fetch from 'node-fetch';
 import { DEFAULT_USER_AGENT } from './proxyserver.js';
 import { setCorsHeaders } from './handleCors.js';
+import { getCachedSegment, setCachedSegment } from '../utils/hlsCache.js';
 
 export async function proxyTs(targetUrl, headers, req, res) {
     try {
+        // Check cache first (only if no range request, as range requests can't be cached easily)
+        if (!req.headers.range) {
+            const cachedSegment = getCachedSegment(targetUrl);
+            if (cachedSegment) {
+                setCorsHeaders(res);
+                res.setHeader('Content-Type', 'video/mp2t');
+                res.setHeader('Content-Length', cachedSegment.length);
+                res.setHeader('Cache-Control', 'public, max-age=300');
+                res.setHeader('X-Cache', 'HIT');
+                res.writeHead(200);
+                res.end(cachedSegment);
+                return;
+            }
+        }
+
         // Handle range requests for video playback
         const fetchHeaders = {
             'User-Agent': DEFAULT_USER_AGENT,
@@ -81,12 +97,30 @@ export async function proxyTs(targetUrl, headers, req, res) {
             // Set status code for range requests
             if (response.status === 206) {
                 res.writeHead(206);
+                res.setHeader('X-Cache', 'MISS');
+                // Stream the response directly for range requests
+                response.body.pipe(res);
             } else {
                 res.writeHead(200);
+                res.setHeader('X-Cache', 'MISS');
+                
+                // For non-range requests, we can cache the segment
+                if (!req.headers.range) {
+                    // Collect the response body using buffer() method
+                    const buffer = await response.buffer();
+                    
+                    // Cache the segment (only if not too large, e.g., < 10MB)
+                    if (buffer.length < 10 * 1024 * 1024) {
+                        setCachedSegment(targetUrl, buffer);
+                    }
+                    
+                    // Send the response
+                    res.end(buffer);
+                } else {
+                    // Stream the response directly for range requests
+                    response.body.pipe(res);
+                }
             }
-
-            // Stream the response directly
-            response.body.pipe(res);
         } catch (fetchError) {
             clearTimeout(timeoutId);
             if (fetchError.name === 'AbortError') {

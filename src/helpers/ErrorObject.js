@@ -146,16 +146,56 @@ export class ErrorObject {
     }
 
     /**
+     * Gets the error code (extracted from message if it follows the pattern "CODE: message")
+     */
+    get code() {
+        // Check if message starts with an error code pattern (e.g., "UPSTREAM_403: message")
+        const codeMatch = this._message.match(/^([A-Z_]+):\s*(.+)$/);
+        if (codeMatch) {
+            return codeMatch[1];
+        }
+        // Default codes based on response code
+        if (this._responseCode === 403) return 'UPSTREAM_403';
+        if (this._responseCode === 401) return 'UPSTREAM_401';
+        if (this._responseCode === 404) return 'NOT_FOUND';
+        if (this._responseCode === 429) return 'RATE_LIMIT_EXCEEDED';
+        return 'ERROR';
+    }
+
+    /**
+     * Gets the error message without the code prefix
+     */
+    get cleanMessage() {
+        const codeMatch = this._message.match(/^[A-Z_]+:\s*(.+)$/);
+        return codeMatch ? codeMatch[1] : this._message;
+    }
+
+    /**
      * Converts the error object to a JSON representation.
      * @returns {Object} A JSON object containing error details.
      */
     toJSON() {
+        const errorCode = this.code;
+        const baseResponse = {
+            code: errorCode,
+            message: this.cleanMessage,
+            hint: this._hint
+        };
+
+        // Add host if available in hint or provider
+        if (this._hint && this._hint.includes('host:')) {
+            const hostMatch = this._hint.match(/host:\s*([^\s,]+)/i);
+            if (hostMatch) {
+                baseResponse.host = hostMatch[1];
+            }
+        }
+
+        // Legacy format for backwards compatibility
         if (this._goesToFrontend && this._issueLink) {
             return {
-                message: this._message,
+                ...baseResponse,
                 location_key: this._provider,
                 response: this._responseCode,
-                hint: this._hint,
                 reportTo:
                     'Please report this error and as many details as possible to us by using this link: ' +
                     strings.DEFAULT_ISSUE_LINK,
@@ -163,15 +203,14 @@ export class ErrorObject {
             };
         } else if (this._goesToFrontend) {
             return {
-                message: this._message,
+                ...baseResponse,
                 response: this._responseCode,
                 location_key: this._provider,
-                hint: this._hint,
                 error: true
             };
         } else {
             return {
-                message: this._message,
+                ...baseResponse,
                 location_key: this._provider,
                 'what could be the cause?': this._hint
             };
