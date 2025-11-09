@@ -8,17 +8,63 @@ import { proxyTs } from './proxyTs.js';
 export const DEFAULT_USER_AGENT =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+// Helper function to get server URL with proper HTTPS detection
+export function getServerUrl(req) {
+    const host = req.headers.host || req.get('host') || req.headers['x-forwarded-host'] || '';
+    
+    // Check if we're on localhost (explicit HTTP for development)
+    const isLocalhost = host.includes('localhost') || 
+                       host.includes('127.0.0.1') || 
+                       host.includes('::1') ||
+                       host.startsWith('192.168.') ||
+                       host.startsWith('10.');
+    
+    // Check if we're on Railway domain (always HTTPS)
+    const isRailway = host.includes('.up.railway.app') || 
+                     host.includes('railway.app');
+    
+    // Check for x-forwarded-proto header (set by Railway/proxies)
+    // Railway should set this, but we'll be defensive
+    let protocol = req.headers['x-forwarded-proto'];
+    
+    // If Railway domain detected, ALWAYS use HTTPS (Railway requires HTTPS)
+    if (isRailway) {
+        protocol = 'https';
+    }
+    // If localhost, use HTTP (development)
+    else if (isLocalhost) {
+        protocol = 'http';
+    }
+    // Try to get protocol from headers
+    else if (!protocol) {
+        protocol = req.protocol; // Works when trust proxy is enabled
+    }
+    
+    // Final fallback: default to HTTPS for production, HTTP for localhost
+    if (!protocol || (protocol !== 'https' && protocol !== 'http')) {
+        protocol = isLocalhost ? 'http' : 'https';
+    }
+    
+    return `${protocol}://${host}`;
+}
+
 export function createProxyRoutes(app) {
-    // Test endpoint to verify proxy is working
+    // Test endpoint to verify proxy is working and check server URL detection
     app.get('/proxy/status', (req, res) => {
         if (handleCors(req, res)) return;
 
+        const serverUrl = getServerUrl(req);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(
             JSON.stringify({
                 status: 'Proxy server is working',
                 timestamp: new Date().toISOString(),
-                userAgent: req.headers['user-agent']
+                userAgent: req.headers['user-agent'],
+                serverUrl: serverUrl,
+                protocol: serverUrl.startsWith('https') ? 'https' : 'http',
+                host: req.headers.host || req.get('host'),
+                xForwardedProto: req.headers['x-forwarded-proto'],
+                reqProtocol: req.protocol
             })
         );
     });
@@ -42,11 +88,8 @@ export function createProxyRoutes(app) {
             return;
         }
 
-        // Get server URL for building proxy URLs
-        const protocol =
-            req.headers['x-forwarded-proto'] || req.protocol || 'http';
-        const host = req.headers.host;
-        const serverUrl = `${protocol}://${host}`;
+        // Get server URL for building proxy URLs with proper HTTPS detection
+        const serverUrl = getServerUrl(req);
 
         proxyM3U8(targetUrl, headers, res, serverUrl);
     });
@@ -92,10 +135,8 @@ export function createProxyRoutes(app) {
             return;
         }
 
-        const protocol =
-            req.headers['x-forwarded-proto'] || req.protocol || 'http';
-        const host = req.headers.host;
-        const serverUrl = `${protocol}://${host}`;
+        // Get server URL for building proxy URLs with proper HTTPS detection
+        const serverUrl = getServerUrl(req);
 
         proxyM3U8(targetUrl, headers, res, serverUrl);
     });

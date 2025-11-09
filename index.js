@@ -2,7 +2,8 @@ import express from 'express';
 import { scrapeMedia } from './src/api.js';
 import {
     createProxyRoutes,
-    processApiResponse
+    processApiResponse,
+    getServerUrl
 } from './src/proxy/proxyserver.js';
 import { getMovieFromTmdb, getTvFromTmdb } from './src/helpers/tmdb.js';
 import cors from 'cors';
@@ -19,6 +20,9 @@ import { fileURLToPath } from 'url';
 const PORT = process.env.PORT;
 const allowedOrigins = process.env.ALLOWED_ORIGINS; // localhost is also allowed. (from any localhost port)
 const app = express();
+
+// Trust proxy to get correct protocol and IP from Railway
+app.set('trust proxy', true);
 
 app.use(
     cors({
@@ -68,10 +72,13 @@ app.get('/movie/:tmdbId', async (req, res) => {
     if (output instanceof ErrorObject) {
         return handleErrorResponse(res, output);
     }
-    const processedOutput = processApiResponse(
-        output,
-        `${req.protocol}://${req.get('host')}`
-    );
+    
+    // Get server URL with proper HTTPS detection
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol || (process.env.NODE_ENV === 'production' ? 'https' : 'http');
+    const host = req.get('host') || req.headers.host;
+    const serverUrl = `${protocol}://${host}`;
+    
+    const processedOutput = processApiResponse(output, serverUrl);
 
     res.status(200).json(processedOutput);
 });
@@ -108,10 +115,10 @@ app.get('/tv/:tmdbId', async (req, res) => {
     if (output instanceof ErrorObject) {
         return handleErrorResponse(res, output);
     }
-    const processedOutput = processApiResponse(
-        output,
-        `${req.protocol}://${req.get('host')}`
-    );
+    
+    // Get server URL with proper HTTPS detection
+    const serverUrl = getServerUrl(req);
+    const processedOutput = processApiResponse(output, serverUrl);
 
     res.status(200).json(processedOutput);
 });
