@@ -139,9 +139,20 @@ export function createProxyRoutes(app) {
             return;
         }
 
+        // Normalize URL encoding (Express automatically decodes query params, so this should be clean)
+        // But ensure we're working with a properly formatted URL
+        let normalizedUrl = targetUrl;
+        try {
+            // If URL is already a valid URL object, reconstruct it to ensure proper encoding
+            const urlObj = new URL(targetUrl);
+            normalizedUrl = urlObj.href; // This ensures proper encoding
+        } catch (e) {
+            // Not a valid URL, validation will catch it below
+        }
+
         // Validate URL format
-        if (!isValidUrl(targetUrl)) {
-            console.error('[M3U8-Proxy] Invalid URL format:', targetUrl.substring(0, 100));
+        if (!isValidUrl(normalizedUrl)) {
+            console.error('[M3U8-Proxy] Invalid URL format:', normalizedUrl.substring(0, 100));
             setCorsHeaders(res);
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ 
@@ -181,21 +192,33 @@ export function createProxyRoutes(app) {
         }, timeout);
 
         try {
-            await proxyM3U8(targetUrl, headers, res, serverUrl);
+            await proxyM3U8(normalizedUrl, headers, res, serverUrl);
         } catch (error) {
             clearTimeout(timeoutId);
             console.error('[M3U8-Proxy] Error:', {
                 message: error.message,
                 stack: error.stack,
-                url: targetUrl.substring(0, 100)
+                url: normalizedUrl ? normalizedUrl.substring(0, 100) : 'unknown'
             });
             
             if (!res.headersSent) {
                 setCorsHeaders(res);
-                res.writeHead(500, { 'Content-Type': 'application/json' });
+                // Determine appropriate status code
+                let statusCode = 500;
+                let errorMessage = error.message || 'Unknown error occurred';
+                
+                if (error.message.includes('timeout')) {
+                    statusCode = 504;
+                    errorMessage = 'Gateway Timeout - upstream server did not respond';
+                } else if (error.message.includes('ECONNREFUSED') || error.message.includes('ENOTFOUND')) {
+                    statusCode = 502;
+                    errorMessage = 'Bad Gateway - could not connect to upstream server';
+                }
+                
+                res.writeHead(statusCode, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ 
-                    error: 'Internal Server Error',
-                    message: 'Failed to proxy manifest: ' + error.message
+                    error: statusCode === 504 ? 'Gateway Timeout' : statusCode === 502 ? 'Bad Gateway' : 'Internal Server Error',
+                    message: errorMessage
                 }));
             }
         } finally {
@@ -226,9 +249,18 @@ export function createProxyRoutes(app) {
             return;
         }
 
+        // Normalize URL encoding (Express automatically decodes query params)
+        let normalizedUrl = targetUrl;
+        try {
+            const urlObj = new URL(targetUrl);
+            normalizedUrl = urlObj.href; // Ensures proper encoding
+        } catch (e) {
+            // Not a valid URL, validation will catch it below
+        }
+
         // Validate URL format
-        if (!isValidUrl(targetUrl)) {
-            console.error('[TS-Proxy] Invalid URL format:', targetUrl.substring(0, 100));
+        if (!isValidUrl(normalizedUrl)) {
+            console.error('[TS-Proxy] Invalid URL format:', normalizedUrl.substring(0, 100));
             setCorsHeaders(res);
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ 
@@ -261,20 +293,32 @@ export function createProxyRoutes(app) {
         }, timeout);
 
         try {
-            await proxyTs(targetUrl, headers, req, res);
+            await proxyTs(normalizedUrl, headers, req, res);
         } catch (error) {
             clearTimeout(timeoutId);
             console.error('[TS-Proxy] Error:', {
                 message: error.message,
-                url: targetUrl.substring(0, 100)
+                url: normalizedUrl ? normalizedUrl.substring(0, 100) : 'unknown'
             });
             
             if (!res.headersSent) {
                 setCorsHeaders(res);
-                res.writeHead(500, { 'Content-Type': 'application/json' });
+                // Determine appropriate status code
+                let statusCode = 500;
+                let errorMessage = error.message || 'Unknown error occurred';
+                
+                if (error.message.includes('timeout')) {
+                    statusCode = 504;
+                    errorMessage = 'Gateway Timeout - upstream server did not respond';
+                } else if (error.message.includes('ECONNREFUSED') || error.message.includes('ENOTFOUND')) {
+                    statusCode = 502;
+                    errorMessage = 'Bad Gateway - could not connect to upstream server';
+                }
+                
+                res.writeHead(statusCode, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ 
-                    error: 'Internal Server Error',
-                    message: 'Failed to proxy segment: ' + error.message
+                    error: statusCode === 504 ? 'Gateway Timeout' : statusCode === 502 ? 'Bad Gateway' : 'Internal Server Error',
+                    message: errorMessage
                 }));
             }
         } finally {
@@ -283,7 +327,7 @@ export function createProxyRoutes(app) {
     });
 
     // HLS Proxy endpoint (alternative endpoint)
-    app.get('/proxy/hls', (req, res) => {
+    app.get('/proxy/hls', async (req, res) => {
         if (handleCors(req, res)) return;
 
         const targetUrl = req.query.link;
@@ -292,20 +336,89 @@ export function createProxyRoutes(app) {
         try {
             headers = JSON.parse(req.query.headers || '{}');
         } catch (e) {
-            // Invalid headers JSON
+            console.warn('[HLS-Proxy] Invalid headers JSON:', e.message);
         }
 
         if (!targetUrl) {
             setCorsHeaders(res);
             res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Link parameter is required' }));
+            res.end(JSON.stringify({ 
+                error: 'Link parameter is required',
+                message: 'The link query parameter is missing'
+            }));
             return;
+        }
+
+        // Normalize URL encoding
+        let normalizedUrl = targetUrl;
+        try {
+            const urlObj = new URL(targetUrl);
+            normalizedUrl = urlObj.href;
+        } catch (e) {
+            // Not a valid URL, validation will catch it
+        }
+
+        // Validate URL format
+        if (!isValidUrl(normalizedUrl)) {
+            setCorsHeaders(res);
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ 
+                error: 'Invalid URL format',
+                message: 'The provided URL is not a valid HTTP/HTTPS URL'
+            }));
+            return;
+        }
+
+        // Validate and fix Referer header if present
+        if (headers.Referer && headers.Origin) {
+            const validReferer = validateRefererHeader(headers.Referer, headers.Origin);
+            if (validReferer && validReferer !== headers.Referer) {
+                headers.Referer = validReferer;
+            }
         }
 
         // Get server URL for building proxy URLs with proper HTTPS detection
         const serverUrl = getServerUrl(req);
 
-        proxyM3U8(targetUrl, headers, res, serverUrl);
+        // Add timeout wrapper
+        const timeout = 60000;
+        const timeoutId = setTimeout(() => {
+            if (!res.headersSent) {
+                setCorsHeaders(res);
+                res.writeHead(504, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ 
+                    error: 'Gateway Timeout',
+                    message: 'The upstream server did not respond in time'
+                }));
+            }
+        }, timeout);
+
+        try {
+            await proxyM3U8(normalizedUrl, headers, res, serverUrl);
+        } catch (error) {
+            clearTimeout(timeoutId);
+            if (!res.headersSent) {
+                setCorsHeaders(res);
+                let statusCode = 500;
+                let errorMessage = error.message || 'Unknown error occurred';
+                
+                if (error.message.includes('timeout')) {
+                    statusCode = 504;
+                    errorMessage = 'Gateway Timeout - upstream server did not respond';
+                } else if (error.message.includes('ECONNREFUSED') || error.message.includes('ENOTFOUND')) {
+                    statusCode = 502;
+                    errorMessage = 'Bad Gateway - could not connect to upstream server';
+                }
+                
+                res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ 
+                    error: statusCode === 504 ? 'Gateway Timeout' : statusCode === 502 ? 'Bad Gateway' : 'Internal Server Error',
+                    message: errorMessage
+                }));
+            }
+        } finally {
+            clearTimeout(timeoutId);
+        }
     });
 
     // Subtitle Proxy endpoint
@@ -324,11 +437,34 @@ export function createProxyRoutes(app) {
         if (!targetUrl) {
             setCorsHeaders(res);
             res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'url parameter required' }));
+            res.end(JSON.stringify({ 
+                error: 'URL parameter required',
+                message: 'The url query parameter is missing'
+            }));
             return;
         }
 
-        fetch(targetUrl, {
+        // Normalize URL encoding
+        let normalizedUrl = targetUrl;
+        try {
+            const urlObj = new URL(targetUrl);
+            normalizedUrl = urlObj.href;
+        } catch (e) {
+            // Not a valid URL, validation will catch it
+        }
+
+        // Validate URL format
+        if (!isValidUrl(normalizedUrl)) {
+            setCorsHeaders(res);
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ 
+                error: 'Invalid URL format',
+                message: 'The provided URL is not a valid HTTP/HTTPS URL'
+            }));
+            return;
+        }
+
+        fetch(normalizedUrl, {
             headers: {
                 'User-Agent': DEFAULT_USER_AGENT,
                 ...headers
@@ -337,8 +473,12 @@ export function createProxyRoutes(app) {
             .then((response) => {
                 if (!response.ok) {
                     setCorsHeaders(res);
-                    res.writeHead(response.status);
-                    res.end(`Subtitle fetch failed: ${response.status}`);
+                    res.writeHead(response.status, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ 
+                        error: 'Subtitle fetch failed',
+                        status: response.status,
+                        statusText: response.statusText
+                    }));
                     return;
                 }
 
@@ -356,8 +496,19 @@ export function createProxyRoutes(app) {
             .catch((error) => {
                 console.error('[Sub Proxy Error]:', error.message);
                 setCorsHeaders(res);
-                res.writeHead(500);
-                res.end(`Subtitle Proxy error: ${error.message}`);
+                let statusCode = 500;
+                let errorMessage = error.message || 'Unknown error occurred';
+                
+                if (error.message.includes('ECONNREFUSED') || error.message.includes('ENOTFOUND')) {
+                    statusCode = 502;
+                    errorMessage = 'Bad Gateway - could not connect to upstream server';
+                }
+                
+                res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ 
+                    error: statusCode === 502 ? 'Bad Gateway' : 'Internal Server Error',
+                    message: errorMessage
+                }));
             });
     });
 }

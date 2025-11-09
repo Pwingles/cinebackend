@@ -2,6 +2,7 @@
 export function handleCors(req, res) {
     // Set CORS headers for all requests
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Origin'); // Important for caching when using specific origins
     res.setHeader(
         'Access-Control-Allow-Methods',
         'GET, HEAD, OPTIONS'
@@ -30,6 +31,7 @@ export function handleCors(req, res) {
 // Use this in proxy functions to ensure CORS headers are always set
 export function setCorsHeaders(res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Origin'); // Important for caching when using specific origins
     res.setHeader(
         'Access-Control-Allow-Methods',
         'GET, HEAD, OPTIONS'
