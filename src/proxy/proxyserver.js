@@ -4,6 +4,44 @@ import { handleCors, setCorsHeaders } from './handleCors.js';
 import { proxyM3U8 } from './m3u8proxy.js';
 import { proxyTs } from './proxyTs.js';
 
+// Helper function to validate and fix Referer header
+// Ensures Referer is always a full URL, not just a video ID
+function validateRefererHeader(referer, origin) {
+    if (!referer) {
+        // No referer provided, use origin
+        return origin ? `${origin}/` : null;
+    }
+    
+    // Check if referer is already a valid URL
+    try {
+        new URL(referer);
+        return referer; // Valid URL
+    } catch (e) {
+        // Not a valid URL - might be just a video ID or path
+        // Construct full URL from origin
+        if (origin) {
+            // If referer looks like a path (starts with /), append to origin
+            if (referer.startsWith('/')) {
+                return `${origin}${referer}`;
+            }
+            // Otherwise, treat as video ID and construct URL
+            return `${origin}/${referer}`;
+        }
+        // No origin available, return null (will be set from URL later)
+        return null;
+    }
+}
+
+// Helper function to validate URL format
+function isValidUrl(urlString) {
+    try {
+        const url = new URL(urlString);
+        return url.protocol === 'http:' || url.protocol === 'https:';
+    } catch (e) {
+        return false;
+    }
+}
+
 // Default user agent
 export const DEFAULT_USER_AGENT =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -70,33 +108,103 @@ export function createProxyRoutes(app) {
     });
 
     // Simplified M3U8 Proxy endpoint based on working implementation
-    app.get('/m3u8-proxy', (req, res) => {
+    app.get('/m3u8-proxy', async (req, res) => {
         if (handleCors(req, res)) return;
 
         const targetUrl = req.query.url;
         let headers = {};
 
+        // Log request for debugging
+        console.log('[M3U8-Proxy] Request received:', {
+            url: targetUrl ? targetUrl.substring(0, 100) + '...' : 'missing',
+            hasHeaders: !!req.query.headers,
+            timestamp: new Date().toISOString()
+        });
+
         try {
             headers = JSON.parse(req.query.headers || '{}');
         } catch (e) {
-            // Invalid headers JSON
+            console.warn('[M3U8-Proxy] Invalid headers JSON:', e.message);
+            // Continue with empty headers
         }
 
+        // Validate URL parameter
         if (!targetUrl) {
             setCorsHeaders(res);
             res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'URL parameter required' }));
+            res.end(JSON.stringify({ 
+                error: 'URL parameter required',
+                message: 'The url query parameter is missing'
+            }));
             return;
+        }
+
+        // Validate URL format
+        if (!isValidUrl(targetUrl)) {
+            console.error('[M3U8-Proxy] Invalid URL format:', targetUrl.substring(0, 100));
+            setCorsHeaders(res);
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ 
+                error: 'Invalid URL format',
+                message: 'The provided URL is not a valid HTTP/HTTPS URL'
+            }));
+            return;
+        }
+
+        // Validate and fix Referer header if present
+        if (headers.Referer && headers.Origin) {
+            const validReferer = validateRefererHeader(headers.Referer, headers.Origin);
+            if (validReferer && validReferer !== headers.Referer) {
+                console.log('[M3U8-Proxy] Fixed invalid Referer:', {
+                    original: headers.Referer,
+                    fixed: validReferer
+                });
+                headers.Referer = validReferer;
+            }
         }
 
         // Get server URL for building proxy URLs with proper HTTPS detection
         const serverUrl = getServerUrl(req);
 
-        proxyM3U8(targetUrl, headers, res, serverUrl);
+        // Add timeout wrapper
+        const timeout = 60000; // 60 seconds timeout
+        const timeoutId = setTimeout(() => {
+            if (!res.headersSent) {
+                console.error('[M3U8-Proxy] Request timeout after', timeout, 'ms');
+                setCorsHeaders(res);
+                res.writeHead(504, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ 
+                    error: 'Gateway Timeout',
+                    message: 'The upstream server did not respond in time'
+                }));
+            }
+        }, timeout);
+
+        try {
+            await proxyM3U8(targetUrl, headers, res, serverUrl);
+        } catch (error) {
+            clearTimeout(timeoutId);
+            console.error('[M3U8-Proxy] Error:', {
+                message: error.message,
+                stack: error.stack,
+                url: targetUrl.substring(0, 100)
+            });
+            
+            if (!res.headersSent) {
+                setCorsHeaders(res);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ 
+                    error: 'Internal Server Error',
+                    message: 'Failed to proxy manifest: ' + error.message
+                }));
+            }
+        } finally {
+            clearTimeout(timeoutId);
+        }
     });
 
     // Simplified TS/Segment Proxy endpoint
-    app.get('/ts-proxy', (req, res) => {
+    app.get('/ts-proxy', async (req, res) => {
         if (handleCors(req, res)) return;
 
         const targetUrl = req.query.url;
@@ -105,17 +213,73 @@ export function createProxyRoutes(app) {
         try {
             headers = JSON.parse(req.query.headers || '{}');
         } catch (e) {
-            // Invalid headers JSON
+            console.warn('[TS-Proxy] Invalid headers JSON:', e.message);
         }
 
         if (!targetUrl) {
             setCorsHeaders(res);
             res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'URL parameter required' }));
+            res.end(JSON.stringify({ 
+                error: 'URL parameter required',
+                message: 'The url query parameter is missing'
+            }));
             return;
         }
 
-        proxyTs(targetUrl, headers, req, res).then((r) => r);
+        // Validate URL format
+        if (!isValidUrl(targetUrl)) {
+            console.error('[TS-Proxy] Invalid URL format:', targetUrl.substring(0, 100));
+            setCorsHeaders(res);
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ 
+                error: 'Invalid URL format',
+                message: 'The provided URL is not a valid HTTP/HTTPS URL'
+            }));
+            return;
+        }
+
+        // Validate and fix Referer header if present
+        if (headers.Referer && headers.Origin) {
+            const validReferer = validateRefererHeader(headers.Referer, headers.Origin);
+            if (validReferer && validReferer !== headers.Referer) {
+                headers.Referer = validReferer;
+            }
+        }
+
+        // Add timeout wrapper
+        const timeout = 60000; // 60 seconds timeout
+        const timeoutId = setTimeout(() => {
+            if (!res.headersSent) {
+                console.error('[TS-Proxy] Request timeout after', timeout, 'ms');
+                setCorsHeaders(res);
+                res.writeHead(504, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ 
+                    error: 'Gateway Timeout',
+                    message: 'The upstream server did not respond in time'
+                }));
+            }
+        }, timeout);
+
+        try {
+            await proxyTs(targetUrl, headers, req, res);
+        } catch (error) {
+            clearTimeout(timeoutId);
+            console.error('[TS-Proxy] Error:', {
+                message: error.message,
+                url: targetUrl.substring(0, 100)
+            });
+            
+            if (!res.headersSent) {
+                setCorsHeaders(res);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ 
+                    error: 'Internal Server Error',
+                    message: 'Failed to proxy segment: ' + error.message
+                }));
+            }
+        } finally {
+            clearTimeout(timeoutId);
+        }
     });
 
     // HLS Proxy endpoint (alternative endpoint)
@@ -222,9 +386,11 @@ export function processApiResponse(apiResponse, serverUrl) {
             // Use M3U8 proxy for HLS streams and unknown formats
             const m3u8Origin = getOriginFromUrl(finalUrl);
             if (m3u8Origin) {
+                // Validate and fix Referer header - ensure it's always a full URL
+                const validReferer = validateRefererHeader(proxyHeaders.Referer, m3u8Origin);
                 proxyHeaders = {
                     ...proxyHeaders,
-                    Referer: proxyHeaders.Referer || m3u8Origin,
+                    Referer: validReferer || `${m3u8Origin}/`,
                     Origin: proxyHeaders.Origin || m3u8Origin
                 };
             }
@@ -241,9 +407,11 @@ export function processApiResponse(apiResponse, serverUrl) {
             // Use TS proxy for direct video files (.mp4, .mkv, .webm, .avi)
             const videoOrigin = getOriginFromUrl(finalUrl);
             if (videoOrigin) {
+                // Validate and fix Referer header - ensure it's always a full URL
+                const validReferer = validateRefererHeader(proxyHeaders.Referer, videoOrigin);
                 proxyHeaders = {
                     ...proxyHeaders,
-                    Referer: proxyHeaders.Referer || videoOrigin,
+                    Referer: validReferer || `${videoOrigin}/`,
                     Origin: proxyHeaders.Origin || videoOrigin
                 };
             }
