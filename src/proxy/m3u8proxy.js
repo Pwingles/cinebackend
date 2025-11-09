@@ -1,6 +1,7 @@
 // M3U8 proxy function based on the working implementation
 import fetch from 'node-fetch';
 import { DEFAULT_USER_AGENT } from './proxyserver.js';
+import { setCorsHeaders } from './handleCors.js';
 
 export async function proxyM3U8(targetUrl, headers, res, serverUrl) {
     try {
@@ -12,6 +13,8 @@ export async function proxyM3U8(targetUrl, headers, res, serverUrl) {
         });
 
         if (!response.ok) {
+            // Set CORS headers even on error responses
+            setCorsHeaders(res);
             res.writeHead(response.status);
             res.end(`M3U8 fetch failed: ${response.status}`);
             return;
@@ -72,7 +75,10 @@ export async function proxyM3U8(targetUrl, headers, res, serverUrl) {
 
         const processedContent = processedLines.join('\n');
 
-        // Set proper headers
+        // Set CORS headers BEFORE setting other headers
+        setCorsHeaders(res);
+        
+        // Set proper headers for M3U8 content
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         res.setHeader('Content-Length', Buffer.byteLength(processedContent));
         res.setHeader('Cache-Control', 'no-cache');
@@ -81,6 +87,8 @@ export async function proxyM3U8(targetUrl, headers, res, serverUrl) {
         res.end(processedContent);
     } catch (error) {
         console.error('[M3U8 Proxy Error]:', error.message);
+        // Set CORS headers even on error responses
+        setCorsHeaders(res);
         res.writeHead(500);
         res.end(`M3U8 Proxy error: ${error.message}`);
     }

@@ -1,6 +1,7 @@
 // TS/Segment proxy function based on the working implementation
 import fetch from 'node-fetch';
 import { DEFAULT_USER_AGENT } from './proxyserver.js';
+import { setCorsHeaders } from './handleCors.js';
 
 export async function proxyTs(targetUrl, headers, req, res) {
     try {
@@ -20,17 +21,22 @@ export async function proxyTs(targetUrl, headers, req, res) {
         });
 
         if (!response.ok) {
+            // Set CORS headers even on error responses
+            setCorsHeaders(res);
             res.writeHead(response.status);
             res.end(`TS fetch failed: ${response.status}`);
             return;
         }
 
+        // Set CORS headers FIRST - critical for HLS.js to read response headers
+        setCorsHeaders(res);
+        
         // Set response headers
         const contentType =
             response.headers.get('content-type') || 'video/mp2t';
         res.setHeader('Content-Type', contentType);
 
-        // Forward important headers from upstream
+        // Forward important headers from upstream (these are exposed via CORS)
         if (response.headers.get('content-length')) {
             res.setHeader(
                 'Content-Length',
@@ -61,6 +67,8 @@ export async function proxyTs(targetUrl, headers, req, res) {
         response.body.pipe(res);
     } catch (error) {
         console.error('[TS Proxy Error]:', error.message);
+        // Set CORS headers even on error responses
+        setCorsHeaders(res);
         res.writeHead(500);
         res.end(`TS Proxy error: ${error.message}`);
     }

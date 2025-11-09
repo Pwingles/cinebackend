@@ -1,6 +1,6 @@
 import fetch from 'node-fetch';
 import { extractOriginalUrl, getOriginFromUrl } from './parser.js';
-import { handleCors } from './handleCors.js';
+import { handleCors, setCorsHeaders } from './handleCors.js';
 import { proxyM3U8 } from './m3u8proxy.js';
 import { proxyTs } from './proxyTs.js';
 
@@ -83,6 +83,7 @@ export function createProxyRoutes(app) {
         }
 
         if (!targetUrl) {
+            setCorsHeaders(res);
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'URL parameter required' }));
             return;
@@ -108,6 +109,7 @@ export function createProxyRoutes(app) {
         }
 
         if (!targetUrl) {
+            setCorsHeaders(res);
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'URL parameter required' }));
             return;
@@ -130,6 +132,7 @@ export function createProxyRoutes(app) {
         }
 
         if (!targetUrl) {
+            setCorsHeaders(res);
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'Link parameter is required' }));
             return;
@@ -155,6 +158,7 @@ export function createProxyRoutes(app) {
         }
 
         if (!targetUrl) {
+            setCorsHeaders(res);
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'url parameter required' }));
             return;
@@ -168,11 +172,14 @@ export function createProxyRoutes(app) {
         })
             .then((response) => {
                 if (!response.ok) {
+                    setCorsHeaders(res);
                     res.writeHead(response.status);
                     res.end(`Subtitle fetch failed: ${response.status}`);
                     return;
                 }
 
+                // Set CORS headers for subtitle responses
+                setCorsHeaders(res);
                 res.setHeader(
                     'Content-Type',
                     response.headers.get('content-type') || 'text/vtt'
@@ -184,6 +191,7 @@ export function createProxyRoutes(app) {
             })
             .catch((error) => {
                 console.error('[Sub Proxy Error]:', error.message);
+                setCorsHeaders(res);
                 res.writeHead(500);
                 res.end(`Subtitle Proxy error: ${error.message}`);
             });
