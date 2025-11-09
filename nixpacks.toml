@@ -5,4 +5,5 @@ nixPkgs = ['nodejs-20_x', 'npm-10_x']
 cmds = ['npm install']
 
 [start]
-cmd = 'node index.js'
+cmd = 'npm start'
+
